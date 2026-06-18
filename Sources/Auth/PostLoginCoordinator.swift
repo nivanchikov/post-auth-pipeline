@@ -32,8 +32,12 @@ public final class PostLoginCoordinator: Sendable {
                         runTask = Task { _ = await engine.run(pipeline, scope: scope) }
                     }
                 case .unauthenticated:
+                    // Capture the session to end BEFORE any await so a re-login
+                    // that begins while we suspend cannot accidentally clear the
+                    // new session. The broker's identity guard is the backstop.
+                    let scopeToEnd = await broker.currentSession()
                     runTask?.cancel()                 // cancel in-flight post-login
-                    if let scope = await broker.currentSession() {
+                    if let scope = scopeToEnd {
                         await broker.endSession(scope) // drop the session context
                     }
                 case .authenticating:
