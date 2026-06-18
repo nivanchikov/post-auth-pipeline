@@ -17,6 +17,14 @@ public struct EngineGatingRunner: GatingRunner {
         let scope = await broker.beginSession()
         switch await engine.run(pipeline, scope: scope) {
         case .completed:
+            // Guard against stale runs: a newer session may have replaced this
+            // one, or the task may have been cancelled. Don't authenticate on a
+            // stale or cancelled run.
+            let stillCurrent = await broker.currentSession() === scope
+            if Task.isCancelled || !stillCurrent {
+                await broker.endSession(scope)
+                return .aborted(SendableErrorBox(CancellationError()))
+            }
             return .success
         case .aborted(let error):
             await broker.endSession(scope)   // login failed → drop the session context
