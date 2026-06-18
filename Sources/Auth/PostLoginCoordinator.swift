@@ -24,14 +24,25 @@ public final class PostLoginCoordinator: Sendable {
         let engine = engine, pipeline = pipeline, broker = broker
         return Task {
             var runTask: Task<Void, Never>?
+            // True if we have seen .authenticating or .authenticated since the
+            // last .unauthenticated. Prevents stale buffered unauthenticated
+            // events from clearing a brand-new session, and lets .authenticating
+            // cancel old post-login work on re-auth.
+            var hadActiveSession = false
             for await state in stream {
                 switch state {
                 case .authenticated:
+                    hadActiveSession = true
                     runTask?.cancel()
                     if let scope = await broker.currentSession() {
                         runTask = Task { _ = await engine.run(pipeline, scope: scope) }
                     }
+                case .authenticating:
+                    hadActiveSession = true
+                    runTask?.cancel()                 // stop old post-login on re-auth
                 case .unauthenticated:
+                    guard hadActiveSession else { continue }
+                    hadActiveSession = false
                     // Capture the session to end BEFORE any await so a re-login
                     // that begins while we suspend cannot accidentally clear the
                     // new session. The broker's identity guard is the backstop.
@@ -40,8 +51,6 @@ public final class PostLoginCoordinator: Sendable {
                     if let scope = scopeToEnd {
                         await broker.endSession(scope) // drop the session context
                     }
-                case .authenticating:
-                    break
                 }
             }
             runTask?.cancel()

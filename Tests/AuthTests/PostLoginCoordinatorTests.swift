@@ -37,6 +37,9 @@ private struct PostOp<M>: Operation {
     let coordinator = PostLoginCoordinator(engine: OperationEngine(), pipeline: pipeline, broker: broker)
     let observation = coordinator.observe(stream)
 
+    // The coordinator only acts on .unauthenticated after an active session,
+    // so simulate the full login → logout transition.
+    cont.yield(.authenticated)
     cont.yield(.unauthenticated(nil))
     let cleared = await poll { await broker.currentSession() == nil }
     observation.cancel()
