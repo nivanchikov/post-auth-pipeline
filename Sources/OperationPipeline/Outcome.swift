@@ -24,3 +24,9 @@ public struct SendableErrorBox: Error, Sendable {
 public func asSendable(_ error: any Error) -> any Error & Sendable {
     (error as? any Error & Sendable) ?? SendableErrorBox(error)
 }
+
+/// Produced when an operation exceeds its declared `timeout`.
+public struct TimeoutError: Error, Sendable, Equatable {
+    public let operation: String
+    public init(operation: String) { self.operation = operation }
+}

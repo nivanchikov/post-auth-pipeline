@@ -64,12 +64,53 @@ public actor OperationEngine {
         let ctx = PipelineContext(outcomes: await scope.snapshot())
         let outcome: AnyOutcomeBox
         if await node.shouldRun(ctx) {
-            outcome = await node.run(ctx)
+            outcome = await runWithOptionalTimeout(node, ctx)
         } else {
             outcome = node.makeSkipped(reason: "guard returned false")
         }
         await scope.complete(node.id, outcome)
         return NodeResult(id: node.id, failurePolicy: node.failurePolicy, outcome: outcome)
+    }
+
+    /// Race the op against its deadline. On expiry, produce a typed `.failed`
+    /// outcome (subject to the op's failurePolicy upstream).
+    ///
+    /// IMPORTANT — why this is NOT a `withTaskGroup`: a task group always awaits
+    /// ALL its children at scope exit. If the op ignores cancellation, exiting the
+    /// group would block until the op returns — defeating the timeout entirely and
+    /// violating the spec's login-liveness guarantee. Instead the op runs in an
+    /// UNSTRUCTURED `Task` whose completion we never await: we read the first racer
+    /// to publish on an `AsyncStream` and return immediately. On timeout we request
+    /// cancellation of the op and ABANDON it (Swift has no forcible termination);
+    /// when it eventually finishes it writes into its own session scope, which is
+    /// safe by the write-boundary invariant.
+    private static func runWithOptionalTimeout(
+        _ node: AnyOperation, _ ctx: RunContext
+    ) async -> AnyOutcomeBox {
+        guard let timeout = node.timeout else { return await node.run(ctx) }
+
+        let (stream, continuation) = AsyncStream<AnyOutcomeBox>.makeStream()
+
+        // The op runs unstructured; we will NOT await its completion.
+        let work = Task {
+            let box = await node.run(ctx)
+            continuation.yield(box)
+            continuation.finish()
+        }
+        // The timer races it.
+        let timer = Task {
+            if (try? await Task.sleep(for: timeout)) != nil {
+                continuation.yield(node.makeFailed(TimeoutError(operation: node.typeName)))
+            }
+            continuation.finish()
+        }
+
+        var iterator = stream.makeAsyncIterator()
+        // First racer to yield wins; if cancelled mid-wait, next() returns nil.
+        let first = await iterator.next() ?? node.makeFailed(TimeoutError(operation: node.typeName))
+        work.cancel()    // request cancellation of the op (cooperative; abandoned otherwise)
+        timer.cancel()
+        return first
     }
 }
 
