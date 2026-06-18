@@ -28,7 +28,8 @@ public actor OperationEngine {
                 if r.outcome.kind == .failed,
                    r.failurePolicy == .close,
                    abortError == nil {
-                    abortError = r.outcome.failureError
+                    // Fallback guarantees abortError is non-nil so the .close failure is never misreported as .completed.
+                    abortError = r.outcome.failureError ?? SendableErrorBox(UnattributedFailure())
                     await scope.abort()
                     group.cancelAll()
                 }
@@ -57,6 +58,9 @@ public actor OperationEngine {
             return NodeResult(id: node.id, failurePolicy: node.failurePolicy, outcome: box)
         }
 
+        // A node already past its gate runs to completion even if an abort fires
+        // afterward: abort cancels gated/future work, not in-flight work. The
+        // per-op timeout (Task 10) is the backstop for a hung in-flight op.
         let ctx = PipelineContext(outcomes: await scope.snapshot())
         let outcome: AnyOutcomeBox
         if await node.shouldRun(ctx) {
@@ -68,6 +72,8 @@ public actor OperationEngine {
         return NodeResult(id: node.id, failurePolicy: node.failurePolicy, outcome: outcome)
     }
 }
+
+private struct UnattributedFailure: Error, Sendable {}
 
 /// Internal per-node result surfaced to the engine's collection loop.
 struct NodeResult: Sendable {
