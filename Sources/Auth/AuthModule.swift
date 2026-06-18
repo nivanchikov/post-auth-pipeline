@@ -26,8 +26,15 @@ public actor AuthModule {
         didSet { continuation.yield(state) }
     }
 
+    /// Single-consumer stream of state changes. `AsyncStream` does not broadcast
+    /// to multiple iterators; the host should consume this from one place (e.g.
+    /// the root coordinator) and fan out if needed.
     public nonisolated let stateStream: AsyncStream<AuthState>
     private let continuation: AsyncStream<AuthState>.Continuation
+
+    /// Monotonically incremented on each `login`/`logout` so a stale, in-flight
+    /// login cannot overwrite state after a newer attempt or logout.
+    private var loginGeneration = 0
 
     public init(backend: AuthBackend, gating: GatingRunner) {
         self.backend = backend
@@ -41,24 +48,31 @@ public actor AuthModule {
     }
 
     public func login(_ credentials: Credentials) async {
+        loginGeneration += 1
+        let generation = loginGeneration
         state = .authenticating
 
         do {
             try await backend.authenticate(credentials)
         } catch {
+            guard generation == loginGeneration else { return }
             state = .unauthenticated(AuthError(failingOperation: nil, underlying: asSendable(error)))
             return
         }
 
+        guard generation == loginGeneration else { return }
         switch await gating.run() {
         case .success:
+            guard generation == loginGeneration else { return }
             state = .authenticated
         case .aborted(let error):
+            guard generation == loginGeneration else { return }
             state = .unauthenticated(AuthError(failingOperation: nil, underlying: error))
         }
     }
 
     public func logout() {
+        loginGeneration += 1
         state = .unauthenticated(nil)
     }
 }

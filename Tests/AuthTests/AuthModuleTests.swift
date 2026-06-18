@@ -17,6 +17,25 @@ private struct StubBackend: AuthBackend {
 }
 private struct BackendError: Error, Sendable {}
 
+private actor Gate {
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+    private var open = false
+    func wait() async {
+        if open { return }
+        await withCheckedContinuation { continuations.append($0) }
+    }
+    func release() { open = true; continuations.forEach { $0.resume() }; continuations = [] }
+}
+
+private struct GatingGate: GatingRunner {
+    let gate: Gate
+    let result: GatingResult
+    func run() async -> GatingResult {
+        await gate.wait()
+        return result
+    }
+}
+
 @Test func successfulLoginReachesAuthenticated() async throws {
     let module = AuthModule(backend: StubBackend(fails: false), gating: StubGating(result: .success))
 
@@ -59,5 +78,29 @@ private struct BackendError: Error, Sendable {}
     let module = AuthModule(backend: StubBackend(fails: false), gating: StubGating(result: .success))
     await module.login(Credentials(username: "u", password: "p"))
     await module.logout()
+    #expect(await module.state == .unauthenticated(nil))
+}
+
+@Test func logoutWhileGatingPreventsStaleAuthentication() async throws {
+    let gate = Gate()
+    let module = AuthModule(
+        backend: StubBackend(fails: false),
+        gating: GatingGate(gate: gate, result: .success)
+    )
+
+    let loginTask = Task { await module.login(Credentials(username: "u", password: "p")) }
+
+    // Wait until login has actually started on the actor before logging out.
+    var started = false
+    for _ in 0..<10_000 {
+        if case .authenticating = await module.state { started = true; break }
+        await Task.yield()
+    }
+    #expect(started)
+
+    await module.logout()
+    await gate.release()
+    _ = await loginTask.value
+
     #expect(await module.state == .unauthenticated(nil))
 }
