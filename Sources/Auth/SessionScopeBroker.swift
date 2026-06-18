@@ -16,5 +16,10 @@ public actor SessionScopeBroker {
 
     public func currentSession() -> SessionScope? { current }
 
-    public func endSession() { current = nil }
+    /// Drops the session **only** if `scope` is still the current one. This
+    /// prevents a stale, overlapping gating run from erasing a newer session
+    /// when it finishes later (forced re-auth / double login race).
+    public func endSession(_ scope: SessionScope) {
+        if current === scope { current = nil }
+    }
 }

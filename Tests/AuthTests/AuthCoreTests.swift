@@ -16,7 +16,17 @@ import OperationPipeline
     #expect(await broker.currentSession() === s1)
     let s2 = await broker.beginSession()           // re-login mints a new scope
     #expect(s2 !== s1)
-    await broker.endSession()
+    await broker.endSession(s2)
+    #expect(await broker.currentSession() == nil)
+}
+
+@Test func brokerEndSessionOnlyClearsMatchingScope() async {
+    let broker = SessionScopeBroker()
+    let s1 = await broker.beginSession()
+    let s2 = await broker.beginSession()           // s2 replaces s1
+    await broker.endSession(s1)                    // stale call must not erase s2
+    #expect(await broker.currentSession() === s2)
+    await broker.endSession(s2)
     #expect(await broker.currentSession() == nil)
 }
 
