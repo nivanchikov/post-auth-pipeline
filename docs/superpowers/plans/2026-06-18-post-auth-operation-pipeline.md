@@ -928,7 +928,10 @@ public actor OperationEngine {
         // risks a type-mismatch trap — nobody `unwrap`s the value returned here.
         for dep in node.dependsOn { _ = await scope.awaitOutcome(of: dep) }
 
-        if Task.isCancelled || (await scope.isAborted) {
+        // NOTE: hoist the await — `await` is not allowed inside the `||`
+        // right-hand autoclosure under Swift 6 strict concurrency.
+        let aborted = await scope.isAborted
+        if Task.isCancelled || aborted {
             let box = node.makeSkipped(reason: "cancelled")
             await scope.complete(node.id, box)
             return NodeResult(id: node.id, failurePolicy: node.failurePolicy, outcome: box)
@@ -1444,11 +1447,11 @@ import Testing
 
     _ = await engine.run(pipeline, scope: scope)
     let first = await scope.liveSnapshot()[ObjectIdentifier(OpA.self)]
-    #expect(first?.unwrap(as: String.self).successValue == "v1")
+    #expect(first?.unwrap(as: String.self)?.successValue == "v1")
 
     _ = await engine.run(pipeline, scope: scope)         // re-run, same scope
     let second = await scope.liveSnapshot()[ObjectIdentifier(OpA.self)]
-    #expect(second?.unwrap(as: String.self).successValue == "v2")  // latest wins
+    #expect(second?.unwrap(as: String.self)?.successValue == "v2")  // latest wins
 }
 
 @Test func crossPipelineReadsSeeLastPublishedValueDuringNoRun() async throws {
@@ -1468,7 +1471,7 @@ import Testing
     _ = await engine.run(postPipeline, scope: scope)
 
     let live = await scope.liveSnapshot()
-    #expect(live[ObjectIdentifier(ReadsA.self)]?.unwrap(as: String.self).successValue == "saw:ent")
+    #expect(live[ObjectIdentifier(ReadsA.self)]?.unwrap(as: String.self)?.successValue == "saw:ent")
 }
 ```
 
@@ -1928,10 +1931,35 @@ git commit -m "feat: add AuthModule state machine with AsyncStream publishing"
 
 **Files:**
 - Create: `Sources/Auth/PostLoginCoordinator.swift`
+- Create: `Tests/AuthTests/AuthTestSupport.swift`
 - Test: `Tests/AuthTests/PostLoginCoordinatorTests.swift`
 - Test: `Tests/AuthTests/WriteBoundaryTests.swift`
 
-- [ ] **Step 1: Write the failing coordinator test**
+- [ ] **Step 1: Write shared auth test support (deterministic, no sleeps)**
+
+`Tests/AuthTests/AuthTestSupport.swift`:
+```swift
+import Foundation
+
+/// Set-once flag a post-login op flips when it runs.
+actor RanFlag { private(set) var value = false; func set() { value = true } }
+
+/// Poll `condition` until it becomes true, yielding between attempts. Returns
+/// false if the bound is exhausted. Deterministic and CI-safe — no fixed sleep
+/// window to lose a race against.
+func poll(
+    until condition: @Sendable () async -> Bool,
+    attempts: Int = 10_000
+) async -> Bool {
+    for _ in 0..<attempts {
+        if await condition() { return true }
+        await Task.yield()
+    }
+    return false
+}
+```
+
+- [ ] **Step 2: Write the failing coordinator test**
 
 `Tests/AuthTests/PostLoginCoordinatorTests.swift`:
 ```swift
@@ -1946,7 +1974,6 @@ private struct PostOp<M>: Operation {
     var failurePolicy: FailurePolicy { .open }
     func run(_ ctx: RunContext) async throws -> String { await ran.set(); return "post" }
 }
-actor RanFlag { private(set) var value = false; func set() { value = true } }
 
 @Test func runsPostLoginPipelineOnAuthenticated() async throws {
     let ran = RanFlag()
@@ -1959,11 +1986,10 @@ actor RanFlag { private(set) var value = false; func set() { value = true } }
     let observation = coordinator.observe(stream)
 
     cont.yield(.authenticated)
-    // Give the coordinator time to run the pipeline.
-    try await Task.sleep(for: .milliseconds(100))
+    let didRun = await poll { await ran.value }   // deterministic, no sleep
     observation.cancel()
 
-    #expect(await ran.value == true)
+    #expect(didRun)
 }
 
 @Test func endsSessionOnUnauthenticated() async throws {
@@ -1977,19 +2003,19 @@ actor RanFlag { private(set) var value = false; func set() { value = true } }
     let observation = coordinator.observe(stream)
 
     cont.yield(.unauthenticated(nil))
-    try await Task.sleep(for: .milliseconds(50))
+    let cleared = await poll { await broker.currentSession() == nil }
     observation.cancel()
 
-    #expect(await broker.currentSession() == nil)   // session cleared on logout
+    #expect(cleared)   // session cleared on logout
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 3: Run test to verify it fails**
 
 Run: `swift test --filter PostLoginCoordinatorTests`
 Expected: FAIL — `PostLoginCoordinator` not defined.
 
-- [ ] **Step 3: Write the implementation**
+- [ ] **Step 4: Write the implementation**
 
 `Sources/Auth/PostLoginCoordinator.swift`:
 ```swift
@@ -2039,12 +2065,12 @@ public final class PostLoginCoordinator: Sendable {
 }
 ```
 
-- [ ] **Step 4: Run coordinator test to verify it passes**
+- [ ] **Step 5: Run coordinator test to verify it passes**
 
 Run: `swift test --filter PostLoginCoordinatorTests`
 Expected: PASS (2 tests).
 
-- [ ] **Step 5: Write the write-boundary security test**
+- [ ] **Step 6: Write the write-boundary security test**
 
 `Tests/AuthTests/WriteBoundaryTests.swift`:
 ```swift
@@ -2098,17 +2124,17 @@ actor Gate {
 }
 ```
 
-- [ ] **Step 6: Run the write-boundary test**
+- [ ] **Step 7: Run the write-boundary test**
 
 Run: `swift test --filter WriteBoundaryTests`
 Expected: PASS (1 test). The stale op's write landed in `scope1`; `scope2` never observes it.
 
-- [ ] **Step 7: Run the full suite**
+- [ ] **Step 8: Run the full suite**
 
 Run: `swift test`
 Expected: ALL tests pass across both targets.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add -A
@@ -2172,9 +2198,9 @@ private struct PushOp: Operation {
     await module.login(Credentials(username: "u", password: "p"))
     #expect(await module.state == .authenticated)
 
-    try await Task.sleep(for: .milliseconds(100))   // let post-login run
+    let didRun = await poll { await pushRan.value }   // deterministic; from AuthTestSupport
     observation.cancel()
-    #expect(await pushRan.value == true)
+    #expect(didRun)
 
     // The shared session context carries the gating entitlements value.
     let scope = await broker.currentSession()
@@ -2186,29 +2212,19 @@ private struct AlwaysOKBackend: AuthBackend {
     func authenticate(_ credentials: Credentials) async throws {}
 }
 ```
-> Note: `RanFlag` is declared in `PostLoginCoordinatorTests.swift`. To share it, move `RanFlag` into a new `Tests/AuthTests/AuthTestSupport.swift` file and remove the duplicate declaration from `PostLoginCoordinatorTests.swift`. Do this move as part of this step so both test files compile.
+> Note: `RanFlag` and `poll(until:)` already live in `Tests/AuthTests/AuthTestSupport.swift` (created in Task 16), so this file uses them directly — no declarations to move.
 
-- [ ] **Step 2: Move `RanFlag` to shared support**
-
-Create `Tests/AuthTests/AuthTestSupport.swift`:
-```swift
-import Foundation
-
-actor RanFlag { private(set) var value = false; func set() { value = true } }
-```
-Remove the `actor RanFlag { ... }` line from `PostLoginCoordinatorTests.swift`.
-
-- [ ] **Step 3: Run the integration test**
+- [ ] **Step 2: Run the integration test**
 
 Run: `swift test --filter IntegrationTests`
 Expected: PASS (1 test).
 
-- [ ] **Step 4: Run the full suite**
+- [ ] **Step 3: Run the full suite**
 
 Run: `swift test`
 Expected: ALL tests pass.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add -A
@@ -2241,7 +2257,7 @@ git commit -m "test: end-to-end gating + post-login integration with worked exam
 - Post-login trigger via `AsyncStream` observation → Task 16.
 - Testing strategy (engine isolation, validation, auth module, coordinator, lifecycle, write-boundary, re-run atomicity) → Tasks 7–12, 15, 16, 17.
 
-No gaps.
+One intentional deferral: the spec notes a pipeline-level *overall* deadline ("a pipeline **may** also carry an overall deadline"). Only the per-operation timeout is implemented (Task 10). The spec hedges this as optional; a pipeline-wide deadline can be added later by wrapping `OperationEngine.run` in the same AsyncStream-race pattern. No other gaps.
 
 **Placeholder scan:** No "TBD"/"TODO"/"handle edge cases" present; all code blocks are complete. The one intentionally-untested path (trap-on-type-mismatch in Task 3) is documented as deliberate, not a placeholder.
 
