@@ -34,8 +34,16 @@ public actor SessionScope {
     /// the same pipeline (cross-pipeline edges are rejected at validation), so
     /// every awaited id eventually completes — unless aborted, which resumes
     /// all waiters so their tasks can unwind.
+    ///
+    /// IMPORTANT: if the scope is aborted or reset (`abort()`/`beginRun()`) while a
+    /// caller is suspended here, the returned box is a SENTINEL whose concrete value
+    /// type is unspecified (`Outcome<Int>`). Callers MUST treat the returned box as a
+    /// completion *signal* only — check `isAborted` and never call `unwrap(as:)` on it.
     public func awaitOutcome(of id: ObjectIdentifier) async -> AnyOutcomeBox {
         if let o = working[id] { return o }
+        // The continuation closure runs synchronously on the actor BEFORE suspension,
+        // so (read working) → (append waiter) is one uninterrupted actor step — no
+        // interleaving with complete(), hence no stranded-continuation deadlock.
         return await withCheckedContinuation { c in
             waiters[id, default: []].append(c)
         }
@@ -64,6 +72,10 @@ public actor SessionScope {
         flushWaiters(with: AnyOutcomeBox(Outcome<Int>.skipped(reason: "aborted")))
     }
 
+    /// Resume every suspended waiter with a wake signal. The sentinel's concrete
+    /// `Outcome<Int>` type (from `abort()`/`beginRun()`) is deliberate-and-irrelevant:
+    /// it is only ever used to unblock the suspended task, never unwrapped, so the
+    /// value type cannot cause an `unwrap(as:)` type-mismatch trap downstream.
     private func flushWaiters(with sentinel: AnyOutcomeBox) {
         let pending = waiters
         waiters = [:]
