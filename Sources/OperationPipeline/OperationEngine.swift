@@ -106,8 +106,11 @@ public actor OperationEngine {
         }
 
         var iterator = stream.makeAsyncIterator()
-        // First racer to yield wins; if cancelled mid-wait, next() returns nil.
-        let first = await iterator.next() ?? node.makeFailed(TimeoutError(operation: node.typeName))
+        // First racer to yield wins.
+        // `next()` returns nil only when the enclosing task was cancelled (e.g. a
+        // fail-close abort elsewhere cancelled the engine's group). That's a
+        // cancellation, not a timeout — label it accordingly.
+        let first = await iterator.next() ?? node.makeSkipped(reason: "cancelled")
         work.cancel()    // request cancellation of the op (cooperative; abandoned otherwise)
         timer.cancel()
         return first

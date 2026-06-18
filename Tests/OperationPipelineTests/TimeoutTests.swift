@@ -11,7 +11,14 @@ private struct SlowOp<M>: Operation {
         return "done"
     }
 }
-private enum SM1 {}; private enum SM2 {}
+private enum SM1 {}; private enum SM2 {}; private enum SM3 {}
+
+private struct QuickOp<M>: Operation {
+    typealias Value = String
+    var failurePolicy: FailurePolicy { .open }
+    var timeout: Duration? { .seconds(5) }   // ample headroom; op returns immediately
+    func run(_ ctx: RunContext) async throws -> String { "quick" }
+}
 
 @Test func failOpenTimeoutIsPrunedAndRunCompletes() async throws {
     let op = SlowOp<SM1>(policy: .open)
@@ -32,4 +39,24 @@ private enum SM1 {}; private enum SM2 {}
     let result = await OperationEngine().run(pipeline, scope: SessionScope())
 
     if case .aborted = result { #expect(Bool(true)) } else { Issue.record("expected abort") }
+}
+
+@Test func opWinsBeforeTimeoutKeepsSuccessValue() async throws {
+    // Op has a timeout but returns promptly, so the op should win the race and
+    // its real success value must be preserved (NOT replaced by a TimeoutError).
+    let op = QuickOp<SM3>()
+    let pipeline = try buildPipeline([AnyOperation(op)])
+    let scope = SessionScope()
+
+    let result = await OperationEngine().run(pipeline, scope: scope)
+
+    #expect(result.isCompleted)
+    let live = await scope.liveSnapshot()
+    let box = live[ObjectIdentifier(QuickOp<SM3>.self)]
+    #expect(box?.kind == .success)
+    if case .success(let v)? = box?.unwrap(as: String.self) {
+        #expect(v == "quick")
+    } else {
+        Issue.record("expected success with the op's real value")
+    }
 }
