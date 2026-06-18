@@ -25,7 +25,13 @@ private struct PushOp: Operation {
     typealias Value = String
     let ran: RanFlag
     var failurePolicy: FailurePolicy { .open }
-    func run(_ ctx: RunContext) async throws -> String { await ran.set(); return "registered" }
+    func run(_ ctx: RunContext) async throws -> String {
+        await ran.set()
+        // Prove the post-login op ran on the SHARED session by reading the
+        // gating-produced entitlements value.
+        let saw = ctx.value(of: EntitlementsOp.self)
+        return "registered:\(saw?.showPaywall ?? false)"
+    }
 }
 
 @Test func fullLoginRunsGatingThenPostLogin() async throws {
@@ -44,14 +50,26 @@ private struct PushOp: Operation {
     await module.login(Credentials(username: "u", password: "p"))
     #expect(await module.state == .authenticated)
 
-    let didRun = await poll { await pushRan.value }   // deterministic; from AuthTestSupport
+    // Wait for the post-login run to publish; `pushRan` flips before publish,
+    // so poll the live map directly for the final outcome.
+    let pushPublished = await poll {
+        let scope = await broker.currentSession()
+        let live = await scope?.liveSnapshot() ?? [:]
+        return live[ObjectIdentifier(PushOp.self)] != nil
+    }
     observation.cancel()
-    #expect(didRun)
+    #expect(pushPublished)
 
-    // The shared session context carries the gating entitlements value.
+    // The shared session context carries the gating entitlements value and the
+    // post-login op saw it.
     let scope = await broker.currentSession()
     let live = await scope?.liveSnapshot() ?? [:]
     #expect(live[ObjectIdentifier(EntitlementsOp.self)]?.kind == .success)
+    if case .success(let v)? = live[ObjectIdentifier(PushOp.self)]?.unwrap(as: String.self) {
+        #expect(v == "registered:true")
+    } else {
+        Issue.record("expected PushOp success with shared-context value")
+    }
 }
 
 private struct AlwaysOKBackend: AuthBackend {
