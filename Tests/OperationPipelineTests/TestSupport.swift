@@ -34,6 +34,29 @@ typealias OpB = Probe<MB>
 typealias OpC = Probe<MC>
 typealias OpD = Probe<MD>
 
+/// Incrementing counter, safe for concurrent access.
+actor Counter {
+    private var n = 0
+    func next() -> Int { n += 1; return n }
+}
+
+extension Outcome {
+    var successValue: Value? { if case .success(let v) = self { return v }; return nil }
+}
+
+/// Post-login-style op (no dependency edge) that reads OpA's value from the
+/// shared session context (live map), proving cross-pipeline reads work.
+struct ReadsA: OperationPipeline.Operation {
+    typealias Value = String
+    let log: RunLog
+    var dependsOn: [any OperationPipeline.Operation.Type] { [] }   // NO edge — reads via shared context
+    var failurePolicy: FailurePolicy { .open }
+    func run(_ ctx: RunContext) async throws -> String {
+        await log.record("ReadsA")
+        return "saw:\(ctx.value(of: OpA.self) ?? "nil")"
+    }
+}
+
 /// D depends on B and C; overrides the default cascade to run when C succeeded,
 /// even though B failed-open. Reads C's value, tolerates B being nil.
 struct OverrideD: OperationPipeline.Operation {
