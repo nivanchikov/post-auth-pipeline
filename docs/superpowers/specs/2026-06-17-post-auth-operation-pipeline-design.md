@@ -168,10 +168,17 @@ let engine = OperationEngine(operations: [
 ])
 ```
 
-At graph-build time (once, at startup) the engine validates: every `dependsOn` type resolves
-to a **registered** instance, and the graph is acyclic. A `dependsOn` referencing an
-unregistered op type, or a cycle, is a **fail-fast startup error** — not a compile error and
-not a silent no-op.
+Validation is **per-pipeline** and runs at graph-build time (once, at startup). For each
+pipeline the engine checks: every `dependsOn` type resolves to an instance **registered in that
+same pipeline**, and the pipeline's graph is acyclic. Three failures are **fail-fast startup
+errors** (not compile errors, not silent no-ops):
+
+- a `dependsOn` referencing an **unregistered** op type,
+- a **cycle**, and
+- a **cross-pipeline edge** — a gating op depending on a post-login op or vice versa. The two
+  pipelines have separate graphs; an edge across them is almost certainly a wiring mistake and
+  is rejected. (Cross-*pipeline* data sharing is intentional and happens only through the
+  shared session context at read time, never through a dependency edge.)
 
 ### Authoring example
 
@@ -207,32 +214,44 @@ fall back to an explicit identifier. Accepted trade-off.
 The engine runs each pipeline as a DAG. Independent nodes run **concurrently**; edges are
 respected.
 
-### Scheduling: per-node await-gates (not a bare TaskGroup)
+### Scheduling: structured children + engine-fulfilled dependency gates
 
 A plain `TaskGroup` only models "spawn N children, await all" — it has **no** notion of "B
-starts after A." So the engine does **not** rely on a bare group for ordering. Instead, each
-node is spawned as a child task that, before running its body, `await`s the completion of its
-dependencies' tasks:
+starts after A." But the obvious fix (hold a `Task` handle per node and `await` upstream
+handles before running) is also wrong: a `Task { … }` created inside the group is
+**unstructured**, so cancelling the group does *not* cancel it. Per-node await-gates and
+structured-child cancellation pull in opposite directions with the raw API. The resolution
+keeps both properties:
+
+- **Every node is a structured child** spawned via `group.addTask` — so cancelling the scope
+  (on logout/abort) cancels every node, and the group naturally awaits them all.
+- **Dependency gating is done by awaiting an engine-fulfilled signal,** not by holding child
+  handles. Before running its body, a node calls `await scope.awaitOutcome(of: upstream)` for
+  each dependency. That call suspends on a per-node continuation the engine resolves the moment
+  the upstream node completes (the upstream's child, on finishing, both stores its outcome and
+  fulfills any waiters). Acyclicity (validated at graph-build) guarantees these awaits cannot
+  form a wait-cycle, so the schedule is deadlock-free.
 
 ```swift
 await withTaskGroup(of: Void.self) { group in
-    var handles: [ObjectIdentifier: Task<AnyOutcomeBox, Never>] = [:]
-    for node in topologicallyOrdered {
-        let deps = node.dependsOn.map { handles[ObjectIdentifier($0)]! }
-        handles[node.id] = Task {
-            for d in deps { _ = await d.value }   // await-gate on upstreams
-            return await run(node, ctx)
+    for node in nodes {                          // order irrelevant; gates enforce edges
+        group.addTask {                          // structured child → cancellable by the scope
+            for dep in node.dependsOn {
+                _ = await scope.awaitOutcome(of: dep)   // suspends until upstream completes
+            }
+            let outcome = await run(node, scope)        // run, then:
+            await scope.complete(node, outcome)         // store + fulfill this node's waiters
         }
     }
-    // group/structured scope awaits all node tasks; cancellation propagates to every child
 }
 ```
 
-This gives **true maximal parallelism** (a node starts the instant *its* upstreams finish, not
-when a whole "level" finishes) and makes cancellation free: cancelling the scope cancels every
-child task. (A simpler "wave scheduling" — topo-sort into levels, run each level in a group —
-is the recorded alternative; it's easier but serializes across levels and loses cross-level
-overlap.)
+This gives **true maximal parallelism** (a node starts the instant *its own* upstreams finish,
+not when a whole "level" finishes) and **structured cancellation** (every node is a real group
+child). The per-node continuations live in the `SessionScope` (an actor), so completion and
+waiter-fulfilment are race-free. (A simpler "wave scheduling" — topo-sort into levels, run each
+level in a sub-group — is the recorded alternative; it's easier but serializes across levels and
+loses cross-level overlap.)
 
 Per-operation lifecycle:
 
@@ -253,8 +272,15 @@ Per-operation lifecycle:
 screen, a hung operation would hang login indefinitely. Each operation may declare a deadline;
 on expiry the engine treats it as a failure subject to the op's own `failurePolicy` (a
 fail-open op times out and is pruned; a fail-close op times out and aborts login). A pipeline
-may also carry an overall deadline. This is the only protection against an op that never
-returns and never observes cancellation.
+may also carry an overall deadline.
+
+Be precise about what a timeout does: Swift has no forcible task termination, so the timeout
+**unblocks the pipeline** — it lets login proceed (or abort) and resolves the node's outcome —
+but it does **not** kill a non-cooperative op that ignores cancellation. Such an op keeps
+running in the background until it returns. That is safe *only* because of the write-boundary
+invariant: when it finally completes it writes into its own (by then possibly discarded)
+session context and can never touch a later session's. The timeout is the protection for *login
+liveness*, not a guarantee of op termination.
 
 ### Cascade Rules (DECIDED: default-skip + guard override)
 
@@ -296,12 +322,27 @@ and diamonds (A → B, A → C, B&C → D) need nothing special for *reads*; "ca
 read, not a hand-off. (Note: this addresses read fan-out only — the *cascade* semantics for
 diamonds are covered separately under Cascade Rules.)
 
-**Within a single run, the context is write-once per operation** (each node writes its outcome
-exactly once, on completion). **Across re-runs of a pipeline it is not append-only** — a
-re-run overwrites entries (see Re-runs). To avoid torn reads during a re-run, a re-run's
-results are applied as an **atomic end-of-run snapshot swap**: readers always see either the
-fully-previous or fully-current set for that pipeline, never a mix of old and new values across
-a diamond. The earlier framing of the context as "append-only" applies only *within* one run.
+**First run — incremental writes into the live map.** Each node writes its outcome exactly
+once, on completion, into the live context. A diamond reader (D reading B and C) still gets
+consistent values because the await-gates make D wait for B and C before it runs — so
+incremental writes are correct here without any snapshotting. The atomicity machinery below is
+**not** about the first run.
+
+**Re-runs — staging map + atomic publish (resolves the append-only vs overwrite tension).** A
+re-run of a pipeline must not tear the previously published values. So a re-run writes into a
+**separate staging map**, not the live map:
+
+- Downstream nodes *within the re-run* read from the staging map (their own run's in-progress
+  values), gated as usual.
+- Readers in the *other* pipeline keep reading the **live** map — i.e. the
+  **stale, last-fully-completed** values — for the whole duration of the re-run. They never see
+  a half-populated re-run.
+- At end-of-run the engine **atomically publishes staging → live** (a single reference swap on
+  the `SessionScope` actor). After the swap, all readers see the new set; before it, all see the
+  old set. Never a mix.
+
+This makes "latest *fully-completed* run wins" precise, and confines the "append-only" framing
+to within a single run.
 
 - A failed-open operation leaves a `.failed` entry (not absent); a guarded-out operation
   leaves `.skipped`. So `value(of:)` returns `nil` while `outcome(of:)` still distinguishes
@@ -350,11 +391,13 @@ the *new* session's context. The invariant that forbids this:
 - The engine **never mutates a context after that context's session terminal event.** A late
   in-flight op holds a reference to the *old* `SessionScope` and writes harmlessly into the
   now-discarded context; it can never reach session N+1's context.
-- Transient per-run state (the node task handles, the in-flight context) is **owned by the
-  `SessionScope`, not stored as actor properties.** So a fast logout→re-login that briefly
-  overlaps a cancelled-old run and a fresh-new run cannot cross wires — each run's state lives
-  in its own scope. ("Stateless across sessions" means exactly this: the actor holds no
-  session-spanning mutable state.)
+- All transient per-run state — the live map, any re-run **staging map**, the per-node
+  completion **continuations** used by the dependency gates — is **owned by the `SessionScope`
+  (itself an actor), not stored as `OperationEngine` properties.** The engine exposes
+  `run(scope:)` and holds no `var currentRun` / `var storage`. So a fast logout→re-login that
+  briefly overlaps a cancelled-old run and a fresh-new run cannot cross wires — each run's state
+  lives in its own scope. ("Stateless across sessions" means exactly this: the engine actor
+  holds no session-spanning mutable state.)
 
 This invariant is explicitly tested (see Testing Strategy: late-completing op must not touch
 the new session's context).
@@ -441,7 +484,8 @@ failures are fail-open by nature (logged, never affecting auth state).
 | Data passing | Typed-value-via-context (engine carries data) | Outcome-status-only (host stores) |
 | Context lifetime | Session-scoped, shared across pipelines, cleared at session end | Per-run context with explicit handoff |
 | Forced re-auth | Treated like logout (drop context) | Preserve context on same-user silent refresh |
-| DAG scheduling | Per-node await-gates over a structured group (max parallelism) | Wave scheduling (level-by-level); custom scheduler |
+| DAG scheduling | Structured `addTask` children + engine-fulfilled dependency gates (max parallelism, cancellable) | Wave scheduling (level-by-level); unstructured `Task` handles (loses cancellation) |
+| Re-run consistency | Staging map + atomic publish→live swap; cross-pipeline readers see last-completed run | Incremental overwrite (rejected — torn diamond reads) |
 | Wiring validation | Host registers instances; presence + acyclicity checked fail-fast at graph-build | Compile-time only (not achievable); silent skip |
 | Concurrency | Actor engine + structured task scope | Actor engine, sequential within run |
 | Hung ops | Per-operation (and pipeline) timeout, applied via `failurePolicy` | No timeout (rejected — hangs login) |
