@@ -762,6 +762,7 @@ git commit -m "feat: add SessionScope actor with dependency-gate continuations"
 `Tests/OperationPipelineTests/TestSupport.swift`:
 ```swift
 import Foundation
+import Testing            // needed once helpers (Task 8's OverrideD) use #expect
 @testable import OperationPipeline
 
 /// Records the order in which operations ran (thread-safe).
@@ -921,6 +922,10 @@ public actor OperationEngine {
 
     /// Run one node: gate on dependencies, evaluate the guard, then run.
     private static func runNode(_ node: AnyOperation, scope: SessionScope) async -> NodeResult {
+        // The awaited box is a SIGNAL ONLY (it tells us the upstream completed);
+        // we discard it and re-read everything from `scope.snapshot()` below.
+        // This is why the abort sentinel's concrete type is irrelevant and never
+        // risks a type-mismatch trap — nobody `unwrap`s the value returned here.
         for dep in node.dependsOn { _ = await scope.awaitOutcome(of: dep) }
 
         if Task.isCancelled || (await scope.isAborted) {
@@ -1038,7 +1043,7 @@ struct OverrideD: Operation {
     }
 }
 ```
-> Note: `#expect` inside a non-test helper requires `import Testing` at the top of `TestSupport.swift`. Add it.
+> Note: `#expect` inside this non-test helper requires `import Testing` at the top of `TestSupport.swift` — already added in Task 7, so no change needed here.
 
 - [ ] **Step 2: Run test to verify it fails (or passes immediately)**
 
@@ -1128,7 +1133,9 @@ Expected: ideally PASS. If `failOpenDoesNotAbortAndPrunesDependents` fails becau
 
 - [ ] **Step 3: If a fail-close test hangs, harden cancellation**
 
-A hang means a node suspended in `awaitOutcome` was never resumed after `group.cancelAll()`. Verify `OperationEngine.run` calls `await scope.abort()` (which flushes waiters) BEFORE/with `group.cancelAll()`, and that `runNode` checks `await scope.isAborted` after its gate loop and returns a skipped box without running. This combination guarantees every child finishes.
+A hang means a node suspended in `awaitOutcome` was never resumed after `group.cancelAll()`. Verify `OperationEngine.run` calls `await scope.abort()` (which flushes waiters) BEFORE/with `group.cancelAll()`, and that `runNode` checks `await scope.isAborted` after its gate loop and returns a skipped box without running.
+
+This combination guarantees every *gated* and every *cooperative* child finishes promptly on abort. It does NOT bound a node already inside a non-cooperative `run` that ignores cancellation — the engine's task group will await that node at scope exit. The contract (matching the spec): **an operation that may not return promptly MUST declare a `timeout`**, which (via Task 10's unstructured race) makes even a non-cooperative op non-blocking. Ops without a timeout are assumed cooperative. Do not weaken this to claim unconditional bounding.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1212,27 +1219,44 @@ if await node.shouldRun(ctx) {
 Add to `OperationEngine`:
 ```swift
 /// Race the op against its deadline. On expiry, produce a typed `.failed`
-/// outcome (subject to the op's failurePolicy upstream). NOTE: this unblocks
-/// the pipeline; it does NOT forcibly kill a non-cooperative op (Swift has no
-/// forcible termination). Safety relies on the write-boundary invariant.
+/// outcome (subject to the op's failurePolicy upstream).
+///
+/// IMPORTANT — why this is NOT a `withTaskGroup`: a task group always awaits
+/// ALL its children at scope exit. If the op ignores cancellation, exiting the
+/// group would block until the op returns — defeating the timeout entirely and
+/// violating the spec's login-liveness guarantee. Instead the op runs in an
+/// UNSTRUCTURED `Task` whose completion we never await: we read the first racer
+/// to publish on an `AsyncStream` and return immediately. On timeout we request
+/// cancellation of the op and ABANDON it (Swift has no forcible termination);
+/// when it eventually finishes it writes into its own session scope, which is
+/// safe by the write-boundary invariant.
 private static func runWithOptionalTimeout(
     _ node: AnyOperation, _ ctx: RunContext
 ) async -> AnyOutcomeBox {
     guard let timeout = node.timeout else { return await node.run(ctx) }
 
-    return await withTaskGroup(of: AnyOutcomeBox?.self) { group in
-        group.addTask { await node.run(ctx) }
-        group.addTask {
-            try? await Task.sleep(for: timeout)
-            return nil   // timeout sentinel
-        }
-        // First child to finish decides.
-        let first = await group.next()!
-        group.cancelAll()
-        _ = await group.next()   // drain the loser
-        if let box = first { return box }     // op finished first
-        return node.makeFailed(TimeoutError(operation: node.typeName))   // timeout won
+    let (stream, continuation) = AsyncStream<AnyOutcomeBox>.makeStream()
+
+    // The op runs unstructured; we will NOT await its completion.
+    let work = Task {
+        let box = await node.run(ctx)
+        continuation.yield(box)
+        continuation.finish()
     }
+    // The timer races it.
+    let timer = Task {
+        if (try? await Task.sleep(for: timeout)) != nil {
+            continuation.yield(node.makeFailed(TimeoutError(operation: node.typeName)))
+        }
+        continuation.finish()
+    }
+
+    var iterator = stream.makeAsyncIterator()
+    // First racer to yield wins; if cancelled mid-wait, next() returns nil.
+    let first = await iterator.next() ?? node.makeFailed(TimeoutError(operation: node.typeName))
+    work.cancel()    // request cancellation of the op (cooperative; abandoned otherwise)
+    timer.cancel()
+    return first
 }
 ```
 
@@ -1244,7 +1268,10 @@ public struct TimeoutError: Error, Sendable, Equatable {
 }
 ```
 
-> Implementation note: the timeout sentinel branch returns `nil` from a `AnyOutcomeBox?` child, distinguishing "op produced a box" from "timer fired." The `try?` on `Task.sleep` lets the loser timer cancel cleanly.
+> Why `AsyncStream`, not `CheckedContinuation`: `AsyncStream.Continuation` is
+> `Sendable`, so capturing it in the two `@Sendable` racer tasks is clean under
+> Swift 6 strict concurrency (a bare `CheckedContinuation` is not `Sendable`).
+> `AnyOutcomeBox` is `Sendable`, so the stream element type is fine.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1764,14 +1791,18 @@ private struct BackendError: Error, Sendable {}
 
 @Test func successfulLoginReachesAuthenticated() async throws {
     let module = AuthModule(backend: StubBackend(fails: false), gating: StubGating(result: .success))
-    var seen: [AuthState] = []
-    let collector = Task { for await s in module.stateStream { seen.append(s) } }
 
     await module.login(Credentials(username: "u", password: "p"))
-    await Task.yield()
-    collector.cancel()
-
     #expect(await module.state == .authenticated)
+
+    // Drain the buffered stream deterministically. AsyncStream's default buffer
+    // is `.unbounded`, so every yielded state is retained; iterate until we see
+    // `.authenticated`, then break (the stream never finishes on its own).
+    var seen: [AuthState] = []
+    for await s in module.stateStream {
+        seen.append(s)
+        if s == .authenticated { break }
+    }
     #expect(seen.contains(.authenticating))
     #expect(seen.contains(.authenticated))
 }
@@ -1978,7 +2009,12 @@ public final class PostLoginCoordinator: Sendable {
         self.broker = broker
     }
 
-    /// Start observing. Returns the observation task; cancel it to stop.
+    /// Start observing. Returns the observation task; cancel it to stop observing.
+    ///
+    /// Note: cancelling the returned task stops consuming the stream, but does
+    /// NOT itself cancel an in-flight post-login run (`runTask` is unstructured).
+    /// The post-login run is cancelled by the `.unauthenticated` branch below —
+    /// i.e. logout cancels the run, which is the guarantee we actually rely on.
     public func observe(_ stream: AsyncStream<AuthState>) -> Task<Void, Never> {
         let engine = engine, pipeline = pipeline, broker = broker
         return Task {
