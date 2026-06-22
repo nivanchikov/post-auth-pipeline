@@ -6,7 +6,7 @@ let package = Package(
     platforms: [.iOS(.v17), .macOS(.v14)],
     products: [
         .library(name: "OperationPipeline", targets: ["OperationPipeline"]),
-        .library(name: "Auth", targets: ["Auth"]),
+        .library(name: "Auth", targets: ["Auth"])
     ],
     targets: [
         .target(
@@ -27,6 +27,6 @@ let package = Package(
             name: "AuthTests",
             dependencies: ["Auth", "OperationPipeline"],
             swiftSettings: [.swiftLanguageMode(.v6)]
-        ),
+        )
     ]
 )

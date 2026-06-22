@@ -4,16 +4,21 @@ import OperationPipeline
 /// fail-close error and identifies the blocking operation, if known.
 public struct AuthError: Error, Sendable {
     public let failingOperation: String?
-    public let underlying: any Error & Sendable
-    public init(failingOperation: String?, underlying: any Error & Sendable) {
+    public let message: String
+
+    public init(failingOperation: String?, message: String) {
         self.failingOperation = failingOperation
-        self.underlying = underlying
+        self.message = message
+    }
+
+    public init(failure: PipelineFailure) {
+        self.init(failingOperation: failure.operation, message: failure.message)
     }
 }
 
 /// Auth state published by the auth module. The host drives login UI off this.
 public enum AuthState: Sendable {
-    case unauthenticated(AuthError?)   // nil = clean / initial
+    case unauthenticated(AuthError?) // nil = clean / initial
     case authenticating
     case authenticated
 }
@@ -23,12 +28,13 @@ extension AuthState: Equatable {
         switch (lhs, rhs) {
         case (.authenticating, .authenticating),
              (.authenticated, .authenticated):
-            return true
-        case let (.unauthenticated(a), .unauthenticated(b)):
+            true
+        case let (.unauthenticated(lhsError), .unauthenticated(rhsError)):
             // Compare by presence + failing-operation label, not error identity.
-            return a?.failingOperation == b?.failingOperation && (a == nil) == (b == nil)
+            lhsError?.failingOperation == rhsError?.failingOperation
+                && (lhsError == nil) == (rhsError == nil)
         default:
-            return false
+            false
         }
     }
 }

@@ -1,8 +1,10 @@
 import Foundation
 
 public struct Pipeline: Sendable {
-    public let operations: [AnyOperation]
-    init(validated operations: [AnyOperation]) { self.operations = operations }
+    let operations: [AnyOperation]
+    init(validated operations: [AnyOperation]) {
+        self.operations = operations
+    }
 }
 
 public enum PipelineValidationError: Error, Equatable {
@@ -18,7 +20,9 @@ public func buildPipeline(_ operations: [AnyOperation]) throws -> Pipeline {
     // 1. Duplicate detection by type identity.
     var byID: [ObjectIdentifier: AnyOperation] = [:]
     for op in operations {
-        if byID[op.id] != nil { throw PipelineValidationError.duplicateType(op.typeName) }
+        if byID[op.id] != nil {
+            throw PipelineValidationError.duplicateType(op.typeName)
+        }
         byID[op.id] = op
     }
 
@@ -32,7 +36,7 @@ public func buildPipeline(_ operations: [AnyOperation]) throws -> Pipeline {
     }
 
     // 3. Cycle detection (DFS over dependency edges).
-    var state: [ObjectIdentifier: Int] = [:]   // 0=unvisited, 1=on-stack, 2=done
+    var state: [ObjectIdentifier: Int] = [:] // 0=unvisited, 1=on-stack, 2=done
     var stack: [String] = []
     func visit(_ id: ObjectIdentifier) throws {
         switch state[id] ?? 0 {
@@ -40,14 +44,20 @@ public func buildPipeline(_ operations: [AnyOperation]) throws -> Pipeline {
         case 1: throw PipelineValidationError.cycle(stack)
         default: break
         }
-        let op = byID[id]!
+        guard let op = byID[id] else {
+            return
+        }
         state[id] = 1
         stack.append(op.typeName)
-        for dep in op.dependsOn { try visit(dep) }
+        for dep in op.dependsOn {
+            try visit(dep)
+        }
         stack.removeLast()
         state[id] = 2
     }
-    for op in operations { try visit(op.id) }
+    for op in operations {
+        try visit(op.id)
+    }
 
     return Pipeline(validated: operations)
 }

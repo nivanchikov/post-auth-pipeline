@@ -10,24 +10,26 @@ public protocol RunContext: Sendable {
 }
 
 /// Concrete `RunContext` backed by an immutable outcome map.
-public struct PipelineContext: RunContext {
+struct PipelineContext: RunContext {
     private let outcomes: [ObjectIdentifier: AnyOutcomeBox]
 
-    public init(outcomes: [ObjectIdentifier: AnyOutcomeBox]) {
+    init(outcomes: [ObjectIdentifier: AnyOutcomeBox]) {
         self.outcomes = outcomes
     }
 
-    public func value<O: Operation>(of type: O.Type) -> O.Value? {
-        guard case .success(let v)? = outcomes[ObjectIdentifier(type)]?.unwrap(as: O.Value.self)
-        else { return nil }
-        return v
+    func value<O: Operation>(of type: O.Type) -> O.Value? {
+        guard case let .success(value)? = outcomes[ObjectIdentifier(type)]?.unwrap(as: O.Value.self)
+        else {
+            return nil
+        }
+        return value
     }
 
-    public func outcome<O: Operation>(of type: O.Type) -> Outcome<O.Value>? {
+    func outcome<O: Operation>(of type: O.Type) -> Outcome<O.Value>? {
         outcomes[ObjectIdentifier(type)]?.unwrap(as: O.Value.self)
     }
 
-    public func succeeded(_ type: any Operation.Type) -> Bool {
+    func succeeded(_ type: any Operation.Type) -> Bool {
         outcomes[ObjectIdentifier(type)]?.kind == .success
     }
 }

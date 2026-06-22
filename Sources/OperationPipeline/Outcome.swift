@@ -4,29 +4,34 @@ import Foundation
 public enum Outcome<Value: Sendable>: Sendable {
     case success(Value)
     case skipped(reason: String)
-    case failed(any Error & Sendable)   // bare `any Error` is NOT Sendable
+    case failed(any Error)
 }
 
 /// Whether an operation's failure aborts login or is tolerated.
 public enum FailurePolicy: Sendable, Equatable {
-    case open   // failure tolerated; the pipeline proceeds without this op
-    case close  // failure aborts the pipeline (login)
+    case open // failure tolerated; the pipeline proceeds without this op
+    case close // failure aborts the pipeline (login)
 }
 
-/// Wraps a non-Sendable error so it can cross concurrency boundaries.
-public struct SendableErrorBox: Error, Sendable {
+/// Concrete failure surfaced by a pipeline abort.
+public struct PipelineFailure: Error, Sendable, Equatable {
+    public let operation: String
     public let message: String
-    public init(_ error: any Error) { self.message = String(describing: error) }
-    public var localizedDescription: String { message }
-}
 
-/// Coerce any thrown error into `any Error & Sendable`, wrapping if necessary.
-public func asSendable(_ error: any Error) -> any Error & Sendable {
-    (error as? any Error & Sendable) ?? SendableErrorBox(error)
+    public init(operation: String, message: String) {
+        self.operation = operation
+        self.message = message
+    }
+
+    public init(operation: String, underlying: any Error) {
+        self.init(operation: operation, message: String(describing: underlying))
+    }
 }
 
 /// Produced when an operation exceeds its declared `timeout`.
 public struct TimeoutError: Error, Sendable, Equatable {
     public let operation: String
-    public init(operation: String) { self.operation = operation }
+    public init(operation: String) {
+        self.operation = operation
+    }
 }

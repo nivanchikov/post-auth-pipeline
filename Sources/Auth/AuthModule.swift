@@ -32,10 +32,6 @@ public actor AuthModule {
     public nonisolated let stateStream: AsyncStream<AuthState>
     private let continuation: AsyncStream<AuthState>.Continuation
 
-    /// Monotonically incremented on each `login`/`logout` so a stale, in-flight
-    /// login cannot overwrite state after a newer attempt or logout.
-    private var loginGeneration = 0
-
     public init(backend: AuthBackend, gating: GatingRunner) {
         self.backend = backend
         self.gating = gating
@@ -44,35 +40,43 @@ public actor AuthModule {
 
     /// Called on app start; host presents login UI when state is unauthenticated.
     public func start() {
-        continuation.yield(state)   // emit current state to fresh observers
+        continuation.yield(state) // emit current state to fresh observers
     }
 
     public func login(_ credentials: Credentials) async {
-        loginGeneration += 1
-        let generation = loginGeneration
+        guard case .unauthenticated = state else {
+            return
+        }
         state = .authenticating
 
         do {
             try await backend.authenticate(credentials)
         } catch {
-            guard generation == loginGeneration else { return }
-            state = .unauthenticated(AuthError(failingOperation: nil, underlying: asSendable(error)))
+            guard case .authenticating = state else {
+                return
+            }
+            state = .unauthenticated(AuthError(failingOperation: nil, message: String(describing: error)))
             return
         }
 
-        guard generation == loginGeneration else { return }
+        guard case .authenticating = state else {
+            return
+        }
         switch await gating.run() {
         case .success:
-            guard generation == loginGeneration else { return }
+            guard case .authenticating = state else {
+                return
+            }
             state = .authenticated
-        case .aborted(let error):
-            guard generation == loginGeneration else { return }
-            state = .unauthenticated(AuthError(failingOperation: nil, underlying: error))
+        case let .aborted(error):
+            guard case .authenticating = state else {
+                return
+            }
+            state = .unauthenticated(AuthError(failure: error))
         }
     }
 
     public func logout() {
-        loginGeneration += 1
         state = .unauthenticated(nil)
     }
 }

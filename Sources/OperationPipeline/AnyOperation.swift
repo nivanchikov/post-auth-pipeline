@@ -5,22 +5,20 @@ import Foundation
 /// boxed with the SAME concrete type the op would produce (so later
 /// `unwrap(as: O.Value.self)` reads never trap).
 public struct AnyOperation: Sendable {
-    public let id: ObjectIdentifier
-    public let valueTypeID: ObjectIdentifier
-    public let dependsOn: [ObjectIdentifier]
-    public let dependsOnTypes: [any Operation.Type]   // retained for diagnostics
-    public let failurePolicy: FailurePolicy
-    public let timeout: Duration?
-    public let typeName: String
+    let id: ObjectIdentifier
+    let dependsOn: [ObjectIdentifier]
+    let dependsOnTypes: [any Operation.Type] // retained for diagnostics
+    let failurePolicy: FailurePolicy
+    let timeout: Duration?
+    let typeName: String
 
     private let _shouldRun: @Sendable (RunContext) async -> Bool
     private let _run: @Sendable (RunContext) async -> AnyOutcomeBox
     private let _skipped: @Sendable (String) -> AnyOutcomeBox
-    private let _failed: @Sendable (any Error & Sendable) -> AnyOutcomeBox
+    private let _failed: @Sendable (any Error) -> AnyOutcomeBox
 
     public init<O: Operation>(_ op: O) {
         id = ObjectIdentifier(O.self)
-        valueTypeID = ObjectIdentifier(O.Value.self)
         dependsOn = op.dependsOn.map { ObjectIdentifier($0) }
         dependsOnTypes = op.dependsOn
         failurePolicy = op.failurePolicy
@@ -29,15 +27,30 @@ public struct AnyOperation: Sendable {
 
         _shouldRun = { await op.shouldRun($0) }
         _run = { ctx in
-            do { return AnyOutcomeBox(Outcome<O.Value>.success(try await op.run(ctx))) }
-            catch { return AnyOutcomeBox(Outcome<O.Value>.failed(asSendable(error))) }
+            do {
+                let value = try await op.run(ctx)
+                return AnyOutcomeBox(Outcome<O.Value>.success(value))
+            } catch {
+                return AnyOutcomeBox(Outcome<O.Value>.failed(error))
+            }
         }
         _skipped = { AnyOutcomeBox(Outcome<O.Value>.skipped(reason: $0)) }
-        _failed  = { AnyOutcomeBox(Outcome<O.Value>.failed($0)) }
+        _failed = { AnyOutcomeBox(Outcome<O.Value>.failed($0)) }
     }
 
-    public func shouldRun(_ ctx: RunContext) async -> Bool { await _shouldRun(ctx) }
-    public func run(_ ctx: RunContext) async -> AnyOutcomeBox { await _run(ctx) }
-    public func makeSkipped(reason: String) -> AnyOutcomeBox { _skipped(reason) }
-    public func makeFailed(_ error: any Error & Sendable) -> AnyOutcomeBox { _failed(error) }
+    func shouldRun(_ ctx: RunContext) async -> Bool {
+        await _shouldRun(ctx)
+    }
+
+    func run(_ ctx: RunContext) async -> AnyOutcomeBox {
+        await _run(ctx)
+    }
+
+    func makeSkipped(reason: String) -> AnyOutcomeBox {
+        _skipped(reason)
+    }
+
+    func makeFailed(_ error: any Error) -> AnyOutcomeBox {
+        _failed(error)
+    }
 }

@@ -1,0 +1,37 @@
+# Lint config for Auth. Strict when run with `--strict`.
+excluded:
+  - .build
+  - build
+  - DerivedData
+  - "**/.build"
+  - "**/.swiftpm"
+  - docs
+
+opt_in_rules:
+  - empty_count
+  - explicit_init
+  - first_where
+  - force_unwrapping
+  - redundant_nil_coalescing
+
+# unused_import only runs under `swiftlint analyze`; normal checks use `lint`. Listed here so an
+# analyze pass can use it later, without the lint-time advisory warning.
+analyzer_rules:
+  - unused_import
+
+disabled_rules:
+  - todo
+
+# Formatting (inline-if wrapping, one-statement-per-line, semicolons, wrapping) is owned entirely by
+# SwiftFormat (.swiftformat). SwiftLint keeps its default + opt_in rules for correctness/style only.
+
+line_length:
+  warning: 120
+  error: 200
+
+identifier_name:
+  min_length: 2
+  excluded: [id, vm, x, y, w, h]
+
+force_cast: error
+force_try: error

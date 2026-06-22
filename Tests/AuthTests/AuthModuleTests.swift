@@ -1,30 +1,44 @@
-import Testing
-import OperationPipeline
 @testable import Auth
+
+// swiftlint:disable identifier_name
+import OperationPipeline
+import Testing
 
 /// Stub gating runner returning a fixed result.
 private struct StubGating: GatingRunner {
     let result: GatingResult
-    func run() async -> GatingResult { result }
+    func run() async -> GatingResult {
+        result
+    }
 }
 
 /// Stub backend that succeeds or throws.
 private struct StubBackend: AuthBackend {
     let fails: Bool
-    func authenticate(_ credentials: Credentials) async throws {
-        if fails { throw BackendError() }
+    func authenticate(_: Credentials) async throws {
+        if fails {
+            throw BackendError()
+        }
     }
 }
+
 private struct BackendError: Error, Sendable {}
 
 private actor Gate {
     private var continuations: [CheckedContinuation<Void, Never>] = []
     private var open = false
     func wait() async {
-        if open { return }
+        if open {
+            return
+        }
         await withCheckedContinuation { continuations.append($0) }
     }
-    func release() { open = true; continuations.forEach { $0.resume() }; continuations = [] }
+
+    func release() {
+        open = true
+        continuations.forEach { $0.resume() }
+        continuations = []
+    }
 }
 
 private struct GatingGate: GatingRunner {
@@ -36,7 +50,7 @@ private struct GatingGate: GatingRunner {
     }
 }
 
-@Test func successfulLoginReachesAuthenticated() async throws {
+@Test func successfulLoginReachesAuthenticated() async {
     let module = AuthModule(backend: StubBackend(fails: false), gating: StubGating(result: .success))
 
     await module.login(Credentials(username: "u", password: "p"))
@@ -48,40 +62,46 @@ private struct GatingGate: GatingRunner {
     var seen: [AuthState] = []
     for await s in module.stateStream {
         seen.append(s)
-        if s == .authenticated { break }
+        if s == .authenticated {
+            break
+        }
     }
     #expect(seen.contains(.authenticating))
     #expect(seen.contains(.authenticated))
 }
 
-@Test func gatingAbortKeepsUnauthenticatedWithWrappedError() async throws {
+@Test func gatingAbortKeepsUnauthenticatedWithWrappedError() async {
     let module = AuthModule(
         backend: StubBackend(fails: false),
-        gating: StubGating(result: .aborted(BackendError()))
+        gating: StubGating(result: .aborted(PipelineFailure(operation: "EntitlementsOp", message: "no entitlements")))
     )
     await module.login(Credentials(username: "u", password: "p"))
-    if case .unauthenticated(let err) = await module.state {
-        #expect(err != nil)
+    if case let .unauthenticated(err) = await module.state {
+        #expect(err?.failingOperation == "EntitlementsOp")
+        #expect(err?.message == "no entitlements")
     } else {
         Issue.record("expected unauthenticated with error")
     }
 }
 
-@Test func backendFailureNeverRunsGating() async throws {
+@Test func backendFailureNeverRunsGating() async {
     let module = AuthModule(backend: StubBackend(fails: true), gating: StubGating(result: .success))
     await module.login(Credentials(username: "u", password: "p"))
-    if case .unauthenticated(let err) = await module.state { #expect(err != nil) }
-    else { Issue.record("expected unauthenticated") }
+    if case let .unauthenticated(err) = await module.state {
+        #expect(err != nil)
+    } else {
+        Issue.record("expected unauthenticated")
+    }
 }
 
-@Test func logoutReturnsToCleanUnauthenticated() async throws {
+@Test func logoutReturnsToCleanUnauthenticated() async {
     let module = AuthModule(backend: StubBackend(fails: false), gating: StubGating(result: .success))
     await module.login(Credentials(username: "u", password: "p"))
     await module.logout()
     #expect(await module.state == .unauthenticated(nil))
 }
 
-@Test func logoutWhileGatingPreventsStaleAuthentication() async throws {
+@Test func logoutWhileGatingPreventsStaleAuthentication() async {
     let gate = Gate()
     let module = AuthModule(
         backend: StubBackend(fails: false),
@@ -92,8 +112,11 @@ private struct GatingGate: GatingRunner {
 
     // Wait until login has actually started on the actor before logging out.
     var started = false
-    for _ in 0..<10_000 {
-        if case .authenticating = await module.state { started = true; break }
+    for _ in 0 ..< 10000 {
+        if case .authenticating = await module.state {
+            started = true
+            break
+        }
         await Task.yield()
     }
     #expect(started)
@@ -104,3 +127,5 @@ private struct GatingGate: GatingRunner {
 
     #expect(await module.state == .unauthenticated(nil))
 }
+
+// swiftlint:enable identifier_name

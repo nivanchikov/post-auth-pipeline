@@ -18,8 +18,13 @@ public protocol Operation: Sendable {
 }
 
 public extension Operation {
-    var dependsOn: [any Operation.Type] { [] }
-    var timeout: Duration? { nil }
+    var dependsOn: [any Operation.Type] {
+        []
+    }
+
+    var timeout: Duration? {
+        nil
+    }
 
     /// Default cascade: run only if EVERY declared dependency succeeded.
     /// Override to take full control (the documented escape hatch for

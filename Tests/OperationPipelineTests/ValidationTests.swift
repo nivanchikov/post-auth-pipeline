@@ -1,5 +1,6 @@
-import Testing
+// swiftlint:disable identifier_name
 @testable import OperationPipeline
+import Testing
 
 @Test func rejectsDuplicateOperationType() {
     let log = RunLog()
@@ -36,3 +37,5 @@ import Testing
     let pipeline = try buildPipeline([AnyOperation(a), AnyOperation(b)])
     #expect(pipeline.operations.count == 2)
 }
+
+// swiftlint:enable identifier_name
