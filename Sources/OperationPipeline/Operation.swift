@@ -10,6 +10,13 @@ public protocol Operation: Sendable {
     var failurePolicy: FailurePolicy { get }
     /// Optional per-op deadline. `nil` = no timeout.
     var timeout: Duration? { get }
+    /// True if this op suspends awaiting a signal the engine cannot itself
+    /// produce (e.g. a human tap) via a continuation that does NOT observe
+    /// cancellation. Such an op cannot free itself if abort-cancelled, so
+    /// `buildPipeline` guarantees it is never abort-cancelled: every fail-close
+    /// op must be a transitive ancestor or descendant of it, never a concurrent
+    /// sibling that could throw and `cancelAll()` mid-suspension. Default `false`.
+    var awaitsExternalInput: Bool { get }
 
     /// Guard + outcome-based blocking. See default below.
     func shouldRun(_ ctx: RunContext) async -> Bool
@@ -24,6 +31,10 @@ public extension Operation {
 
     var timeout: Duration? {
         nil
+    }
+
+    var awaitsExternalInput: Bool {
+        false
     }
 
     /// Default cascade: run only if EVERY declared dependency succeeded.

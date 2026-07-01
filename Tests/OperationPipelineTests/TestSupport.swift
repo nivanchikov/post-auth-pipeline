@@ -19,6 +19,7 @@ struct Probe<Marker>: OperationPipeline.Operation {
     let log: RunLog
     let deps: [any OperationPipeline.Operation.Type]
     let policy: FailurePolicy
+    var interactive = false
     let body: @Sendable (RunContext) async throws -> String
 
     var dependsOn: [any OperationPipeline.Operation.Type] {
@@ -27,6 +28,10 @@ struct Probe<Marker>: OperationPipeline.Operation {
 
     var failurePolicy: FailurePolicy {
         policy
+    }
+
+    var awaitsExternalInput: Bool {
+        interactive
     }
 
     func run(_ ctx: RunContext) async throws -> String {

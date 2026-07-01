@@ -10,6 +10,7 @@ public struct AnyOperation: Sendable {
     let dependsOnTypes: [any Operation.Type] // retained for diagnostics
     let failurePolicy: FailurePolicy
     let timeout: Duration?
+    let awaitsExternalInput: Bool
     let typeName: String
 
     private let _shouldRun: @Sendable (RunContext) async -> Bool
@@ -23,6 +24,7 @@ public struct AnyOperation: Sendable {
         dependsOnTypes = op.dependsOn
         failurePolicy = op.failurePolicy
         timeout = op.timeout
+        awaitsExternalInput = op.awaitsExternalInput
         typeName = String(describing: O.self)
 
         _shouldRun = { await op.shouldRun($0) }
