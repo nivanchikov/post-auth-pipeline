@@ -42,9 +42,8 @@ can call to run the gating work.
   pipeline is not a compile-time guarantee** — see "Registration & graph validation." A
   `dependsOn` pointing at an op type that was never registered is caught at graph-build time
   (fail fast at startup), not by the compiler.
-- **Swift 6 / strict concurrency.** Actor-isolated engine, `Sendable` throughout, structured
-  concurrency for parallelism and cancellation. Errors are carried as `any Error & Sendable`
-  (bare `any Error` is not `Sendable`).
+- **Swift 6 / strict concurrency.** `Sendable` throughout, structured concurrency for
+  parallelism and cancellation. Pipeline aborts surface a concrete `PipelineFailure`.
 
 ## Architecture
 
@@ -80,7 +79,7 @@ Three players. The auth module is deliberately ignorant of operations.
 
 - The shared DAG executor. Used to build **two pipelines** from two different operation sets:
   the gating pipeline and the post-login pipeline. Same engine, same authoring model.
-- Stateless across sessions; per-run state lives in a `SessionScope` (see Context Lifecycle).
+- Stateless across sessions; per-run state lives in internal `RunState` (see Context Lifecycle).
 
 ### PostLoginCoordinator
 
@@ -106,7 +105,7 @@ There is no minted operation id and no separate key type.
 enum Outcome<Value: Sendable>: Sendable {
     case success(Value)
     case skipped(reason: String)
-    case failed(any Error & Sendable)   // bare `any Error` is NOT Sendable
+    case failed(any Error)
 }
 
 enum FailurePolicy: Sendable {
@@ -161,11 +160,12 @@ it. The *executable* node (the configured instance with its injected collaborato
 therefore registered separately by the host:
 
 ```swift
-let engine = OperationEngine(operations: [
+let pipeline = try buildPipeline([
     EntitlementsOp(client: entitlementsClient),
     PaywallOp(),
     // ...
 ])
+let engine = OperationEngine()
 ```
 
 Validation is **per-pipeline** and runs at graph-build time (once, at startup). For each
@@ -177,8 +177,7 @@ errors** (not compile errors, not silent no-ops):
 - a **cycle**, and
 - a **cross-pipeline edge** — a gating op depending on a post-login op or vice versa. The two
   pipelines have separate graphs; an edge across them is almost certainly a wiring mistake and
-  is rejected. (Cross-*pipeline* data sharing is intentional and happens only through the
-  shared session context at read time, never through a dependency edge.)
+  is rejected.
 
 ### Authoring example
 
@@ -248,7 +247,7 @@ await withTaskGroup(of: Void.self) { group in
 
 This gives **true maximal parallelism** (a node starts the instant *its own* upstreams finish,
 not when a whole "level" finishes) and **structured cancellation** (every node is a real group
-child). The per-node continuations live in the `SessionScope` (an actor), so completion and
+child). The per-node continuations live in the `RunState` actor, so completion and
 waiter-fulfilment are race-free. (A simpler "wave scheduling" — topo-sort into levels, run each
 level in a sub-group — is the recorded alternative; it's easier but serializes across levels and
 loses cross-level overlap.)
@@ -272,15 +271,12 @@ Per-operation lifecycle:
 screen, a hung operation would hang login indefinitely. Each operation may declare a deadline;
 on expiry the engine treats it as a failure subject to the op's own `failurePolicy` (a
 fail-open op times out and is pruned; a fail-close op times out and aborts login). A pipeline
-may also carry an overall deadline.
+does not carry a separate overall deadline in this version.
 
-Be precise about what a timeout does: Swift has no forcible task termination, so the timeout
-**unblocks the pipeline** — it lets login proceed (or abort) and resolves the node's outcome —
-but it does **not** kill a non-cooperative op that ignores cancellation. Such an op keeps
-running in the background until it returns. That is safe *only* because of the write-boundary
-invariant: when it finally completes it writes into its own (by then possibly discarded)
-session context and can never touch a later session's. The timeout is the protection for *login
-liveness*, not a guarantee of op termination.
+Timeouts are implemented with a structured task-group race between the operation and a timer.
+That keeps cancellation structured and simple, but it is cooperative: Swift has no forcible
+task termination, and a non-cooperative operation that ignores cancellation can still delay the
+group from returning. Operation authors should make network calls and waits cancellation-aware.
 
 ### Cascade Rules (DECIDED: default-skip + guard override)
 
@@ -322,27 +318,15 @@ and diamonds (A → B, A → C, B&C → D) need nothing special for *reads*; "ca
 read, not a hand-off. (Note: this addresses read fan-out only — the *cascade* semantics for
 diamonds are covered separately under Cascade Rules.)
 
-**First run — incremental writes into the live map.** Each node writes its outcome exactly
-once, on completion, into the live context. A diamond reader (D reading B and C) still gets
-consistent values because the await-gates make D wait for B and C before it runs — so
-incremental writes are correct here without any snapshotting. The atomicity machinery below is
-**not** about the first run.
+**Session outcome map.** Each node writes its outcome exactly once, on completion, into the
+run context. A diamond reader (D reading B and C) still gets consistent values because the
+await-gates make D wait for B and C before it runs. Gating and post-login do not share pipeline
+context; if they need common domain data, that data should live in injected collaborators or
+stores.
 
-**Re-runs — staging map + atomic publish (resolves the append-only vs overwrite tension).** A
-re-run of a pipeline must not tear the previously published values. So a re-run writes into a
-**separate staging map**, not the live map:
-
-- Downstream nodes *within the re-run* read from the staging map (their own run's in-progress
-  values), gated as usual.
-- Readers in the *other* pipeline keep reading the **live** map — i.e. the
-  **stale, last-fully-completed** values — for the whole duration of the re-run. They never see
-  a half-populated re-run.
-- At end-of-run the engine **atomically publishes staging → live** (a single reference swap on
-  the `SessionScope` actor). After the swap, all readers see the new set; before it, all see the
-  old set. Never a mix.
-
-This makes "latest *fully-completed* run wins" precise, and confines the "append-only" framing
-to within a single run.
+Pipeline re-runs are deliberately not modeled. If a host needs foreground refreshes or repeated
+pipelines later, that should be added as a separate, explicit requirement instead of carrying
+staging/publish machinery in the first version.
 
 - A failed-open operation leaves a `.failed` entry (not absent); a guarded-out operation
   leaves `.skipped`. So `value(of:)` returns `nil` while `outcome(of:)` still distinguishes
@@ -358,80 +342,42 @@ Open alternative (recorded, not chosen):
 
 ## Context Lifecycle
 
-**The context is scoped to one auth session, shared across both pipelines.**
+**The context is scoped to one engine run.**
 
-- **Born** when login begins; the gating run creates the `SessionScope` that owns the context.
-- **Accumulates** as operations complete (both pipelines write into the same context).
-- **Shared across pipelines:** the same context gating populated is handed to the post-login
-  run, so a post-login operation can read a value a gating operation produced (e.g. a banner
-  op reading `Entitlements`) without refetching or a store.
-- **Cleared** deterministically at session end. The `SessionScope` is dropped and every cached
-  value with it. There is no manual reset.
+- A gating pipeline run gets its own internal `RunState`.
+- A post-login pipeline run gets a separate internal `RunState`.
+- The auth layer does not broker or retain scopes.
+- Re-login naturally starts fresh because each `OperationEngine.run(_:)` creates fresh run state.
 
-Session-ending events, all treated identically (DECIDED — forced re-auth treated like logout):
-
-- **Logout** (`logout()` → `.unauthenticated`).
-- **Fail-close abort** during gating (login never completes).
-- **Forced re-auth / token expiry** — even if the same user re-authenticates silently, the
-  context is dropped and a fresh one is minted. Preserving across silent refresh is explicitly
-  **not** done.
-
-**Re-login mints a brand-new empty context.** This is a correctness/security boundary: a new
-session must never read the prior session's values (no cross-user data leakage).
-
-### Write-boundary invariant (prevents cross-session leakage under cancellation)
-
-The clear-vs-write race is the place the no-leak guarantee can quietly fail: a post-login
-operation that is mid-`run()` past a logout could, if it resolves later, write its outcome into
-the *new* session's context. The invariant that forbids this:
-
-- An operation's `RunContext` is **bound at task spawn** and threaded explicitly into
-  `run(ctx)`/`shouldRun(ctx)`. There is **no global "current context" accessor** an op can
-  reach through to find "the live session."
-- The engine **never mutates a context after that context's session terminal event.** A late
-  in-flight op holds a reference to the *old* `SessionScope` and writes harmlessly into the
-  now-discarded context; it can never reach session N+1's context.
-- All transient per-run state — the live map, any re-run **staging map**, the per-node
-  completion **continuations** used by the dependency gates — is **owned by the `SessionScope`
-  (itself an actor), not stored as `OperationEngine` properties.** The engine exposes
-  `run(scope:)` and holds no `var currentRun` / `var storage`. So a fast logout→re-login that
-  briefly overlaps a cancelled-old run and a fresh-new run cannot cross wires — each run's state
-  lives in its own scope. ("Stateless across sessions" means exactly this: the engine actor
-  holds no session-spanning mutable state.)
-
-This invariant is explicitly tested (see Testing Strategy: late-completing op must not touch
-the new session's context).
+There is no cross-session pipeline data to clear. Operations that need durable domain data should
+write to injected collaborators/stores rather than relying on pipeline context.
 
 ### Re-runs within a session
 
-- Re-triggering the post-login pipeline in the same session (e.g. app returns to foreground)
-  re-executes that pipeline's operations and **overwrites** their entries via the atomic
-  end-of-run snapshot swap (see Data Flow). Latest fully-completed run wins; no torn reads.
-  Cross-pipeline reads then see the freshest value.
-- Only the pipeline actually run executes; a post-login re-trigger does not re-run gating
-  operations.
+Re-runs are out of scope for this version. The session context is an accumulated outcome map,
+not a transactional re-run store. If repeated post-login refresh becomes a concrete need, add it
+with explicit semantics then.
 
 ## Concurrency, Cancellation, Errors
 
-- **Engine is an `actor`.** Each pipeline run uses a structured task scope with per-node
+- **Engine is stateless.** Each pipeline run uses a structured task scope with per-node
   await-gates (see Scheduling) so independent DAG nodes execute concurrently while edges are
-  respected. Everything is `Sendable` / Swift 6 strict-concurrency clean (errors carried as
-  `any Error & Sendable`). Per-run transient state is owned by the `SessionScope`, not stored
-  as actor properties, so an overlapping cancelled-old / fresh-new run pair never crosses wires.
+  respected. Everything is `Sendable` / Swift 6 strict-concurrency clean. Per-run transient
+  state is owned by `RunState`, not stored on `OperationEngine`, so overlapping runs never
+  cross wires.
 - **Cancellation:** logout / abort / forced re-auth cancels the in-flight post-login run;
   in-flight operations observe `Task` cancellation cooperatively, with a per-op timeout as the
   backstop for ops that never observe cancellation. Re-login starts a fresh run. A
   late-completing op writes only into its own now-discarded session context, never the new one
   (see Write-boundary invariant).
-- **Error surfacing (DECIDED):** the engine reports a structured failure (the first
-  fail-close operation's type + its underlying `any Error & Sendable`). The **auth module catches this and
-  wraps it in its own `AuthError` type**, exposed on `AuthState`, so the login screen can show
-  a tailored message and offer retry. The engine does not know about UI; the auth module owns
-  the mapping.
+- **Error surfacing (DECIDED):** the engine reports a `PipelineFailure` with the first
+  fail-close operation's type name and a diagnostic message. The auth module wraps this in its
+  own `AuthError` type, exposed on `AuthState`, so the login screen can show a tailored message
+  and offer retry. The engine does not know about UI; the auth module owns the mapping.
 
 ### Gating return contract
 
-`GatingRunner.run()` returns `.success` or `.aborted(underlying)`. The auth module flips to
+`GatingRunner.run()` returns `.success` or `.aborted(PipelineFailure)`. The auth module flips to
 `.authenticated` only on `.success`; otherwise it stays unauthenticated and surfaces a wrapped
 `AuthError`. Post-login never blocks anything: it is launched by the coordinator and its
 failures are fail-open by nature (logged, never affecting auth state).
@@ -454,9 +400,6 @@ failures are fail-open by nature (logged, never affecting auth state).
 - **Write-boundary (security):** an operation still in-flight when logout fires, completing
   *after* the session ended, must not write into the new session's context — assert the
   next session's context never observes the late op's value.
-- **Re-run atomicity:** during a pipeline re-run, a reader observing a diamond never sees a mix
-  of previous-run and current-run values.
-
 ## Scope, Scale & Known Limitations
 
 - **Expected scale:** a handful of operations per pipeline (~5–15), shallow depth. The
@@ -471,6 +414,8 @@ failures are fail-open by nature (logged, never affecting auth state).
   still evaluate against my own upstreams" from "skip me and cascade." Today a guarded-out op
   is `.skipped` and cascades per the default rule. This expressivity limit is accepted as
   YAGNI; revisit only if a concrete case needs the distinction.
+- **No transactional re-runs.** Re-triggering a pipeline in the same session is not a first-class
+  requirement. Add explicit rerun semantics only when a concrete workflow needs them.
 
 ## Decisions Summary
 
@@ -485,9 +430,9 @@ failures are fail-open by nature (logged, never affecting auth state).
 | Context lifetime | Session-scoped, shared across pipelines, cleared at session end | Per-run context with explicit handoff |
 | Forced re-auth | Treated like logout (drop context) | Preserve context on same-user silent refresh |
 | DAG scheduling | Structured `addTask` children + engine-fulfilled dependency gates (max parallelism, cancellable) | Wave scheduling (level-by-level); unstructured `Task` handles (loses cancellation) |
-| Re-run consistency | Staging map + atomic publish→live swap; cross-pipeline readers see last-completed run | Incremental overwrite (rejected — torn diamond reads) |
+| Re-run consistency | Not modeled in v1 | Staging map + atomic publish→live swap |
 | Wiring validation | Host registers instances; presence + acyclicity checked fail-fast at graph-build | Compile-time only (not achievable); silent skip |
-| Concurrency | Actor engine + structured task scope | Actor engine, sequential within run |
-| Hung ops | Per-operation (and pipeline) timeout, applied via `failurePolicy` | No timeout (rejected — hangs login) |
+| Concurrency | Stateless engine + structured task scope + internal `RunState` actor | Sequential within run |
+| Hung ops | Per-operation cooperative timeout, applied via `failurePolicy` | No timeout; unstructured abandoned tasks |
 | Error surfacing | Auth module wraps engine error in `AuthError` on state | Generic failure, details logged only |
 ```

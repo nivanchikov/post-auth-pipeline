@@ -1,0 +1,45 @@
+# SwiftFormat config for Auth. Runs BEFORE SwiftLint (format -> then lint catches the rest).
+# Formatting is owned here; SwiftLint owns correctness/style rules SwiftFormat can't express.
+
+--swiftversion 6.0
+--maxwidth 120
+
+# Call/parameter/collection wrapping - this is what handles nested-call wrapping correctly
+# (by AST + line width, no regex false positives).
+--wraparguments before-first
+--wrapparameters before-first
+--wrapcollections before-first
+--closingparen balanced
+
+# One statement per line; no semicolon-joined statements.
+--semicolons never
+
+--indent 4
+--trimwhitespace always
+--emptybraces no-space
+
+# Wrap inline conditional bodies onto their own line: `if x { foo() }` -> multi-line. Covers
+# if/guard/else (broader than a regex).
+--enable wrapConditionalBodies
+
+# Disabled - semantic rules that fight project conventions:
+#   redundantSwiftTestingSuite - preserve bare `@Suite` declarations.
+#   redundantSendable          - preserve explicit Sendable annotations (strict-concurrency intent).
+# Disabled - CONFLICTS with SwiftLint:
+#   wrapMultilineStatementBraces - would put `{` on its own line after a multi-line condition;
+#                                  SwiftLint `opening_brace` requires it on the same line.
+--disable redundantSwiftTestingSuite,redundantSendable,wrapMultilineStatementBraces
+
+# --- SwiftLint conflict avoidance (verified against .swiftlint.yml) ---
+# trailing_comma: SwiftLint's default rule FLAGS trailing commas, so SwiftFormat must NOT add them.
+--commas inline
+
+# All other default rules ENABLED, notably:
+#   wrapEnumCases  - one enum case per line
+#   andOperator    - `if x && y` -> `if x, y` (idiomatic comma-separated conditions; SwiftFormat only
+#                    converts genuine if/guard/while conditions, not returned Bool expressions or
+#                    `for...where` clauses)
+
+# Exclude generated / build output (mirrors .swiftlint.yml `excluded:`) + non-source trees so
+# SwiftFormat doesn't waste time walking them.
+--exclude **/.build,**/DerivedData,**/.swiftpm,build,docs
